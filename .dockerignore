@@ -1,0 +1,13 @@
+.git
+.github
+.env
+.env.*
+**/.env
+**/.env.*
+!.env.example
+**/*.pem
+**/*.key
+ci
+coverage.out
+*.test
+*.test.exe

@@ -1,0 +1,36 @@
+name: Go
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+    tags: ['**']
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@v7.0.0
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Vet
+        run: go vet ./...
+      - name: Test with coverage
+        run: go test -race -coverpkg=./... -covermode=atomic -coverprofile=coverage.out ./...
+      - name: Coverage summary
+        run: go tool cover -func=coverage.out
+      - name: Upload coverage
+        uses: codecov/codecov-action@v7.1.1
+        with:
+          token: ${{ secrets.CODECOV_TOKEN }}
+          files: coverage.out
+          flags: unittests
+          disable_search: true
+          fail_ci_if_error: true
