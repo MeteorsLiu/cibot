@@ -13,6 +13,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"encoding/pem"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -29,8 +30,10 @@ import (
 	"testing"
 	"time"
 
+	"github.com/alicebob/miniredis/v2"
 	"github.com/bradleyfalzon/ghinstallation/v2"
 	"github.com/google/go-github/v83/github"
+	"github.com/hibiken/asynq"
 )
 
 func TestServeHTTP(t *testing.T) {
@@ -114,7 +117,7 @@ func TestServeHTTP(t *testing.T) {
 	})
 
 	t.Run("constructor", func(t *testing.T) {
-		bot, _ := newTestBot(t, string(secret), func(w http.ResponseWriter, r *http.Request) {
+		bot, _, _ := newTestBot(t, string(secret), func(w http.ResponseWriter, r *http.Request) {
 			t.Error("constructor or ping made an API request")
 			w.WriteHeader(http.StatusInternalServerError)
 		})
@@ -135,15 +138,117 @@ func TestServeHTTP(t *testing.T) {
 		}
 
 		missing := filepath.Join(t.TempDir(), "missing.pem")
-		if bot, err := New(string(secret), 123, missing); err == nil || bot != nil {
+		if bot, err := New(string(secret), 123, missing, ""); err == nil || bot != nil {
 			t.Fatal("missing key must return a nil bot and an error")
 		}
 		invalid := filepath.Join(t.TempDir(), "invalid.pem")
 		if err := os.WriteFile(invalid, []byte("not a private key"), 0600); err != nil {
 			t.Fatal(err)
 		}
-		if bot, err := New(string(secret), 123, invalid); err == nil || bot != nil {
+		if bot, err := New(string(secret), 123, invalid, ""); err == nil || bot != nil {
 			t.Fatal("invalid key must return a nil bot and an error")
+		}
+	})
+
+	t.Run("queued task survives request cancellation", func(t *testing.T) {
+		entered := make(chan struct{})
+		release := make(chan struct{})
+		releaseTask := sync.OnceFunc(func() { close(release) })
+		defer releaseTask()
+		var filesCalls atomic.Int64
+		bot, _, inspector := newTestBot(t, string(secret), func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			switch r.URL.Path {
+			case "/app/installations/7/access_tokens":
+				close(entered)
+				<-release
+				if err := r.Context().Err(); err != nil {
+					t.Errorf("worker inherited webhook cancellation: %v", err)
+				}
+				fmt.Fprintf(w, `{"token":"installation-7","expires_at":%q}`, time.Now().Add(time.Hour).UTC().Format(time.RFC3339))
+			case "/repos/llarhub/.index/pulls/3/files":
+				filesCalls.Add(1)
+				io.WriteString(w, `[]`)
+			default:
+				t.Errorf("unexpected request: %s", r.URL.Path)
+				w.WriteHeader(http.StatusNotFound)
+			}
+		})
+		body := []byte(`{"action":"closed","number":3,"pull_request":{"merged":true,"merge_commit_sha":"queued-merge","base":{"ref":"main"}},"repository":{"full_name":"llarhub/.index"},"installation":{"id":7}}`)
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		request := httptest.NewRequest(http.MethodPost, "/", bytes.NewReader(body)).WithContext(ctx)
+		request.Header.Set("Content-Type", "application/json")
+		request.Header.Set(github.EventTypeHeader, "pull_request")
+		request.Header.Set(github.SHA256SignatureHeader, signPayload(secret, body))
+		response := httptest.NewRecorder()
+		responded := make(chan struct{})
+		go func() {
+			bot.ServeHTTP(response, request)
+			close(responded)
+		}()
+		select {
+		case <-responded:
+		case <-time.After(5 * time.Second):
+			t.Fatal("webhook waited for the blocked worker")
+		}
+		if response.Code != http.StatusAccepted {
+			t.Fatalf("status = %d, want accepted: %s", response.Code, response.Body.String())
+		}
+		cancel()
+		select {
+		case <-entered:
+		case <-time.After(5 * time.Second):
+			t.Fatal("constructor did not start the worker")
+		}
+		const id = "pull_request:llarhub/.index@queued-merge"
+		info, err := inspector.GetTaskInfo(queueName, id)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if info.Timeout != 80*time.Hour || !info.Deadline.IsZero() || !bytes.Equal(info.Payload, body) {
+			t.Fatalf("queued task changed its timeout, deadline, or payload: %+v", info)
+		}
+		duplicate := httptest.NewRequest(http.MethodPost, "/", bytes.NewReader(body))
+		duplicate.Header = request.Header.Clone()
+		duplicateResponse := httptest.NewRecorder()
+		bot.ServeHTTP(duplicateResponse, duplicate)
+		if duplicateResponse.Code != http.StatusAccepted {
+			t.Fatalf("duplicate status = %d, want accepted", duplicateResponse.Code)
+		}
+		queue, err := inspector.GetQueueInfo(queueName)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if queue.Size != 1 {
+			t.Fatalf("duplicate created another task: size=%d", queue.Size)
+		}
+		releaseTask()
+		if err := waitTask(t, inspector, id); err != nil {
+			t.Fatal(err)
+		}
+		if filesCalls.Load() != 1 {
+			t.Fatalf("worker ran %d times, want once", filesCalls.Load())
+		}
+	})
+
+	t.Run("enqueue failure is not acknowledged", func(t *testing.T) {
+		bot, _, _ := newTestBot(t, string(secret), func(w http.ResponseWriter, r *http.Request) {
+			t.Error("failed enqueue executed a task")
+			w.WriteHeader(http.StatusInternalServerError)
+		})
+		if err := bot.queue.Close(); err != nil {
+			t.Fatal(err)
+		}
+		body := []byte(`{"ref":"refs/heads/c","after":"source-commit","repository":{"full_name":"MeteorsLiu/yyjson"}}`)
+		request := httptest.NewRequest(http.MethodPost, "/", bytes.NewReader(body))
+		request.Header.Set("Content-Type", "application/json")
+		request.Header.Set(github.EventTypeHeader, "push")
+		request.Header.Set(github.SHA256SignatureHeader, signPayload(secret, body))
+		response := httptest.NewRecorder()
+		bot.ServeHTTP(response, request)
+		if response.Code != http.StatusInternalServerError {
+			t.Fatalf("enqueue failure status = %d, want 500", response.Code)
 		}
 	})
 }
@@ -153,7 +258,7 @@ func TestWebhookRouting(t *testing.T) {
 	t.Setenv("GIT_CONFIG_NOSYSTEM", "1")
 	secret := []byte("test-webhook-secret")
 	var apiRequests atomic.Int64
-	bot, _ := newTestBot(t, string(secret), func(w http.ResponseWriter, r *http.Request) {
+	bot, _, inspector := newTestBot(t, string(secret), func(w http.ResponseWriter, r *http.Request) {
 		apiRequests.Add(1)
 		w.Header().Set("Content-Type", "application/json")
 		switch {
@@ -180,10 +285,11 @@ func TestWebhookRouting(t *testing.T) {
 		body         string
 		want         int
 		wantRequests int64
+		taskID       string
 	}{
-		{name: "production merged PR", event: "pull_request", body: `{"action":"closed","number":3,"pull_request":{"merged":true,"base":{"ref":"main"}},"repository":{"full_name":"llarhub/.index"},"installation":{"id":7}}`, want: http.StatusOK, wantRequests: 2},
-		{name: "test merged PR", event: "pull_request", body: `{"action":"closed","number":3,"pull_request":{"merged":true,"base":{"ref":"main"}},"repository":{"full_name":"MeteorsLiu/llarhub"},"installation":{"id":8}}`, want: http.StatusOK, wantRequests: 2},
-		{name: "repeat production merged PR", event: "pull_request", body: `{"action":"closed","number":3,"pull_request":{"merged":true,"base":{"ref":"main"}},"repository":{"full_name":"llarhub/.index"},"installation":{"id":7}}`, want: http.StatusOK, wantRequests: 1},
+		{name: "production merged PR", event: "pull_request", body: `{"action":"closed","number":3,"pull_request":{"merged":true,"merge_commit_sha":"merged","base":{"ref":"main"}},"repository":{"full_name":"llarhub/.index"},"installation":{"id":7}}`, want: http.StatusAccepted, wantRequests: 2, taskID: "pull_request:llarhub/.index@merged"},
+		{name: "test merged PR", event: "pull_request", body: `{"action":"closed","number":3,"pull_request":{"merged":true,"merge_commit_sha":"merged","base":{"ref":"main"}},"repository":{"full_name":"MeteorsLiu/llarhub"},"installation":{"id":8}}`, want: http.StatusAccepted, wantRequests: 2, taskID: "pull_request:MeteorsLiu/llarhub@merged"},
+		{name: "repeat production merged PR", event: "pull_request", body: `{"action":"closed","number":3,"pull_request":{"merged":true,"merge_commit_sha":"merged","base":{"ref":"main"}},"repository":{"full_name":"llarhub/.index"},"installation":{"id":7}}`, want: http.StatusAccepted, wantRequests: 1, taskID: "pull_request:llarhub/.index@merged"},
 		{name: "closed without merging", event: "pull_request", body: `{"action":"closed","pull_request":{"merged":false,"base":{"ref":"main"}},"repository":{"full_name":"llarhub/.index"}}`, want: http.StatusNoContent},
 		{name: "opened PR", event: "pull_request", body: `{"action":"opened","pull_request":{"merged":false,"base":{"ref":"main"}},"repository":{"full_name":"llarhub/.index"}}`, want: http.StatusNoContent},
 		{name: "different base", event: "pull_request", body: `{"action":"closed","pull_request":{"merged":true,"base":{"ref":"dev"}},"repository":{"full_name":"llarhub/.index"}}`, want: http.StatusNoContent},
@@ -206,6 +312,11 @@ func TestWebhookRouting(t *testing.T) {
 			bot.ServeHTTP(response, request)
 			if response.Code != tc.want {
 				t.Fatalf("status = %d, want %d; body = %q", response.Code, tc.want, response.Body.String())
+			}
+			if tc.taskID != "" {
+				if err := waitTask(t, inspector, tc.taskID); err != nil {
+					t.Fatal(err)
+				}
 			}
 			if got := apiRequests.Load() - before; got != tc.wantRequests {
 				t.Fatalf("API requests = %d, want %d", got, tc.wantRequests)
@@ -341,7 +452,7 @@ func TestWebhookRouting(t *testing.T) {
 				var repos []string
 				var key *rsa.PrivateKey
 				var bot *Bot
-				bot, key = newTestBot(t, string(secret), func(w http.ResponseWriter, r *http.Request) {
+				bot, key, _ = newTestBot(t, string(secret), func(w http.ResponseWriter, r *http.Request) {
 					mu.Lock()
 					defer mu.Unlock()
 					w.Header().Set("Content-Type", "application/json")
@@ -505,7 +616,7 @@ func TestWebhookRouting(t *testing.T) {
 		var token7, token8 atomic.Int64
 		entered := make(chan string, 2)
 		release := make(chan struct{})
-		bot, _ := newTestBot(t, string(secret), func(w http.ResponseWriter, r *http.Request) {
+		bot, _, _ := newTestBot(t, string(secret), func(w http.ResponseWriter, r *http.Request) {
 			w.Header().Set("Content-Type", "application/json")
 			if r.Method == http.MethodPost && (r.URL.Path == "/app/installations/7/access_tokens" || r.URL.Path == "/app/installations/8/access_tokens") {
 				id := strings.Split(r.URL.Path, "/")[3]
@@ -613,7 +724,7 @@ func TestWebhookRouting(t *testing.T) {
 	t.Run("git authentication and push", testGitPush)
 }
 
-func newTestBot(t *testing.T, secret string, handler http.HandlerFunc) (*Bot, *rsa.PrivateKey) {
+func newTestBot(t *testing.T, secret string, handler http.HandlerFunc) (*Bot, *rsa.PrivateKey, *asynq.Inspector) {
 	t.Helper()
 	key, err := rsa.GenerateKey(rand.Reader, 2048)
 	if err != nil {
@@ -624,7 +735,8 @@ func newTestBot(t *testing.T, secret string, handler http.HandlerFunc) (*Bot, *r
 	if err := os.WriteFile(keyFile, data, 0600); err != nil {
 		t.Fatal(err)
 	}
-	bot, err := New(secret, 123, keyFile)
+	redis := miniredis.RunT(t)
+	bot, err := New(secret, 123, keyFile, redis.Addr())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -647,7 +759,38 @@ func newTestBot(t *testing.T, secret string, handler http.HandlerFunc) (*Bot, *r
 	}
 	t.Cleanup(transport.CloseIdleConnections)
 	bot.transport = ghinstallation.NewAppsTransportFromPrivateKey(transport, 123, key)
-	return bot, key
+	inspector := asynq.NewInspector(asynq.RedisClientOpt{Addr: redis.Addr()})
+	t.Cleanup(func() {
+		bot.worker.Shutdown()
+		bot.queue.Close()
+		inspector.Close()
+	})
+	return bot, key, inspector
+}
+
+func waitTask(t *testing.T, inspector *asynq.Inspector, id string) error {
+	t.Helper()
+	deadline := time.NewTimer(30 * time.Second)
+	defer deadline.Stop()
+	ticker := time.NewTicker(10 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		info, err := inspector.GetTaskInfo(queueName, id)
+		if errors.Is(err, asynq.ErrTaskNotFound) {
+			return nil
+		}
+		if err != nil {
+			t.Fatal(err)
+		}
+		if info.State == asynq.TaskStateRetry || info.State == asynq.TaskStateArchived {
+			return errors.New(info.LastErr)
+		}
+		select {
+		case <-deadline.C:
+			t.Fatalf("task %s did not finish; state=%v", id, info.State)
+		case <-ticker.C:
+		}
+	}
 }
 
 func signPayload(secret, body []byte) string {

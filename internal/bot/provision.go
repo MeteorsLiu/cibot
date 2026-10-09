@@ -133,7 +133,11 @@ func (b *Bot) provision(ctx context.Context, client *github.Client, indexRepo *g
 		return err
 	}
 	refs := []string{"refs/heads/c:refs/heads/c", "refs/heads/" + base + ":refs/heads/" + base}
-	if isNew {
+	tags, err := git(ctx, client, repoDir, "tag", "--list", "v0.1.0", "c/v0.1.0")
+	if err != nil {
+		return err
+	}
+	if tags == "" {
 		if _, err := git(ctx, client, repoDir, "tag", "c/v0.1.0", "c"); err != nil {
 			return err
 		}

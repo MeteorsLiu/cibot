@@ -24,14 +24,19 @@ func testProvision(t *testing.T) {
 		name, owner, index, ownerType, base string
 		existing, cBranch, failGen, repeat  bool
 		failInit                            bool
+		mainTag, cTag                       bool
 		toc                                 string
 	}{
 		{name: "new personal repository", owner: "MeteorsLiu", index: "llarhub", ownerType: "User", base: "main"},
 		{name: "new organization repository", owner: "llarhub", index: ".index", ownerType: "Organization", base: "main"},
-		{name: "existing repository", owner: "MeteorsLiu", index: "llarhub", ownerType: "User", base: "main", existing: true, cBranch: true},
-		{name: "existing repository without c branch", owner: "MeteorsLiu", index: "llarhub", ownerType: "User", base: "trunk", existing: true},
+		{name: "existing repository", owner: "MeteorsLiu", index: "llarhub", ownerType: "User", base: "main", existing: true, cBranch: true, mainTag: true, cTag: true},
+		{name: "existing repository without c branch", owner: "MeteorsLiu", index: "llarhub", ownerType: "User", base: "trunk", existing: true, mainTag: true, cTag: true},
+		{name: "resume after repository creation", owner: "MeteorsLiu", index: "llarhub", ownerType: "User", base: "main", existing: true},
+		{name: "resume unpublished c branch", owner: "MeteorsLiu", index: "llarhub", ownerType: "User", base: "main", existing: true, cBranch: true},
+		{name: "preserve main tag alone", owner: "MeteorsLiu", index: "llarhub", ownerType: "User", base: "main", existing: true, cBranch: true, mainTag: true},
+		{name: "preserve c tag alone", owner: "MeteorsLiu", index: "llarhub", ownerType: "User", base: "main", existing: true, cBranch: true, cTag: true},
 		{name: "append existing toc", owner: "MeteorsLiu", index: "llarhub", ownerType: "User", base: "main", toc: "old/native old\n"},
-		{name: "duplicate toc mapping", owner: "MeteorsLiu", index: "llarhub", ownerType: "User", base: "main", existing: true, toc: "upstream/libfoo libfoo\n", repeat: true},
+		{name: "duplicate toc mapping", owner: "MeteorsLiu", index: "llarhub", ownerType: "User", base: "main", existing: true, mainTag: true, cTag: true, toc: "upstream/libfoo libfoo\n", repeat: true},
 		{name: "generation failure keeps toc PR", owner: "MeteorsLiu", index: "llarhub", ownerType: "User", base: "main", failGen: true},
 		{name: "initialization failure keeps toc PR", owner: "MeteorsLiu", index: "llarhub", ownerType: "User", base: "main", failInit: true},
 	} {
@@ -114,16 +119,19 @@ fi
 				testGitCommand(t, projectCheckout, "push", "origin", "c")
 				cParent = testGitCommand(t, projectRemote, "rev-parse", "c")
 			}
-			if tc.existing {
+			if tc.mainTag {
 				testGitCommand(t, projectCheckout, "tag", "v0.1.0", mainParent)
+				testGitCommand(t, projectCheckout, "push", "origin", "refs/tags/v0.1.0")
+			}
+			if tc.cTag {
 				testGitCommand(t, projectCheckout, "tag", "c/v0.1.0", cParent)
-				testGitCommand(t, projectCheckout, "push", "origin", "refs/tags/v0.1.0", "refs/tags/c/v0.1.0")
+				testGitCommand(t, projectCheckout, "push", "origin", "refs/tags/c/v0.1.0")
 			}
 			var mu sync.Mutex
 			created, pulls := 0, 0
 			indexPrefix := "/repos/" + tc.owner + "/" + tc.index
 			projectPrefix := "/repos/" + tc.owner + "/libfoo"
-			bot, _ := newTestBot(t, "secret", func(w http.ResponseWriter, r *http.Request) {
+			bot, _, inspector := newTestBot(t, "secret", func(w http.ResponseWriter, r *http.Request) {
 				mu.Lock()
 				defer mu.Unlock()
 				w.Header().Set("Content-Type", "application/json")
@@ -224,12 +232,13 @@ fi
 				request.Header.Set(github.SHA256SignatureHeader, signPayload([]byte("secret"), body))
 				response := httptest.NewRecorder()
 				bot.ServeHTTP(response, request)
-				want := http.StatusOK
-				if tc.failGen || tc.failInit {
-					want = http.StatusInternalServerError
-				}
+				want := http.StatusAccepted
 				if response.Code != want {
 					t.Fatalf("status = %d, want %d: %s", response.Code, want, response.Body.String())
+				}
+				err := waitTask(t, inspector, "pull_request:"+tc.owner+"/"+tc.index+"@"+mergeSHA)
+				if (err != nil) != (tc.failGen || tc.failInit) {
+					t.Fatalf("task error = %v, want failure=%t", err, tc.failGen || tc.failInit)
 				}
 			}
 			if !bot.initMu.TryLock() {
@@ -320,12 +329,25 @@ fi
 				t.Fatal("c branch lost its history")
 			}
 			mainTag, cTag := mainParent, cParent
-			if !tc.existing {
+			initial := !tc.mainTag && !tc.cTag
+			if initial {
 				mainTag = testGitCommand(t, projectRemote, "rev-parse", tc.base)
 				cTag = testGitCommand(t, projectRemote, "rev-parse", "c")
 			}
-			if testGitCommand(t, projectRemote, "rev-parse", "v0.1.0") != mainTag || testGitCommand(t, projectRemote, "rev-parse", "c/v0.1.0") != cTag {
-				t.Fatal("initial tags were not preserved or did not point to the published modules")
+			for _, tag := range []struct {
+				name, want string
+				exists     bool
+			}{
+				{name: "v0.1.0", want: mainTag, exists: tc.mainTag || initial},
+				{name: "c/v0.1.0", want: cTag, exists: tc.cTag || initial},
+			} {
+				if tag.exists {
+					if got := testGitCommand(t, projectRemote, "rev-parse", tag.name); got != tag.want {
+						t.Fatalf("tag %s = %s, want %s", tag.name, got, tag.want)
+					}
+				} else if got := testGitCommand(t, projectRemote, "tag", "--list", tag.name); got != "" {
+					t.Fatalf("unexpected tag %s", tag.name)
+				}
 			}
 			if got := testGitCommand(t, projectRemote, "log", "-1", "--format=%an <%ae>", tc.base); got != "llarhub-bot[bot] <339421020+llarhub-bot[bot]@users.noreply.github.com>" {
 				t.Fatalf("unexpected commit author: %s", got)
@@ -375,7 +397,7 @@ printf 'package foo\n' > "$1/foo.go"
 			}
 		}
 		t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
-		bot, _ := newTestBot(t, "secret", func(w http.ResponseWriter, r *http.Request) {
+		bot, _, _ := newTestBot(t, "secret", func(w http.ResponseWriter, r *http.Request) {
 			w.Header().Set("Content-Type", "application/json")
 			switch r.URL.Path {
 			case "/app/installations/7/access_tokens":

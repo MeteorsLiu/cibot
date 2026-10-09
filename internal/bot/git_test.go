@@ -66,7 +66,7 @@ func testGitPush(t *testing.T) {
 
 	testWriteFiles(t, second, map[string]string{"README.md": "stale publisher\n"})
 	testGitCommand(t, second, "commit", "-am", "Stale publisher")
-	bot, _ := newTestBot(t, "secret", func(w http.ResponseWriter, r *http.Request) {
+	bot, _, _ := newTestBot(t, "secret", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost || (r.URL.Path != "/app/installations/7/access_tokens" && r.URL.Path != "/app/installations/8/access_tokens") {
 			t.Errorf("unexpected API request: %s %s", r.Method, r.URL.Path)
 			w.WriteHeader(http.StatusNotFound)

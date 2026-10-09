@@ -29,10 +29,16 @@ RUN git clone https://github.com/xgo-dev/llar.git /opt/llar \
     && go build -ldflags="-checklinkname=0" -o /usr/local/bin/llar ./cmd/llar
 RUN llgo version && llar --help && llcppg -h
 
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends redis-server redis-tools \
+    && mkdir -p /var/lib/redis
+
 COPY --from=build /out/ci /usr/local/bin/ci
+COPY --chmod=755 docker/entrypoint.sh /usr/local/libexec/cibot-entrypoint
 WORKDIR /app
 # Public defaults let --env-file supply configuration without baking in secrets.
 COPY .env.example .env
+VOLUME ["/var/lib/redis"]
 EXPOSE 80
-ENTRYPOINT ["/usr/local/bin/ci"]
+ENTRYPOINT ["/usr/local/libexec/cibot-entrypoint"]
 CMD ["serve"]

@@ -3,6 +3,7 @@ package bot
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"net/http"
@@ -10,16 +11,22 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/bradleyfalzon/ghinstallation/v2"
 	"github.com/google/go-github/v83/github"
+	"github.com/hibiken/asynq"
 )
+
+const queueName = "cibot"
 
 // Bot receives GitHub webhooks. Its secret must remain unchanged while serving.
 type Bot struct {
 	WebhookSecret string
 
 	transport *ghinstallation.AppsTransport
+	queue     *asynq.Client
+	worker    *asynq.Server
 	// clientsMu protects client lookup and creation, not network requests.
 	clientsMu sync.Mutex
 	clients   map[int64]*github.Client
@@ -31,21 +38,29 @@ type Bot struct {
 
 var _ http.Handler = (*Bot)(nil)
 
-// New loads the App's private key and initializes an empty client cache without
-// network requests. Installation IDs come from individual webhook deliveries.
-func New(webhookSecret string, appID int64, privateKeyFile string) (*Bot, error) {
+// New loads the App's private key and starts its private Asynq worker.
+// Redis owns accepted tasks independently of webhook connections and this process.
+func New(webhookSecret string, appID int64, privateKeyFile, redisAddr string) (*Bot, error) {
 	transport, err := ghinstallation.NewAppsTransportKeyFromFile(http.DefaultTransport, appID, privateKeyFile)
 	if err != nil {
 		return nil, err
 	}
-	return &Bot{
+	redis := asynq.RedisClientOpt{Addr: redisAddr}
+	b := &Bot{
 		WebhookSecret: webhookSecret,
 		transport:     transport,
 		clients:       make(map[int64]*github.Client),
-	}, nil
+		queue:         asynq.NewClient(redis),
+		worker:        asynq.NewServer(redis, asynq.Config{Queues: map[string]int{queueName: 1}}),
+	}
+	if err := b.worker.Start(asynq.HandlerFunc(b.process)); err != nil {
+		b.queue.Close()
+		return nil, err
+	}
+	return b, nil
 }
 
-// ServeHTTP verifies and parses POST deliveries before dispatching their events.
+// ServeHTTP verifies and queues relevant POST deliveries before acknowledging them.
 // The caller owns the HTTP server, routing, listening address, and shutdown.
 func (b *Bot) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
@@ -71,35 +86,64 @@ func (b *Bot) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	delivery := github.DeliveryID(r)
+	var repo, revision string
 	switch event := event.(type) {
 	case *github.PingEvent:
 		log.Printf("bot: webhook ping delivery=%s installation=%d", delivery, event.GetInstallation().GetID())
 		w.WriteHeader(http.StatusOK)
 		return
 	case *github.PullRequestEvent:
-		handled, err := b.handlePullRequest(r.Context(), delivery, event)
-		if err != nil {
-			log.Printf("bot: process merged PR delivery=%s: %v", delivery, err)
-			http.Error(w, "failed to process merged PR", http.StatusInternalServerError)
+		if event.GetAction() != "closed" || !event.GetPullRequest().GetMerged() ||
+			event.GetPullRequest().GetBase().GetRef() != "main" {
+			w.WriteHeader(http.StatusNoContent)
 			return
 		}
-		if handled {
-			w.WriteHeader(http.StatusOK)
+		repo = event.GetRepo().GetFullName()
+		switch repo {
+		case "llarhub/.index", "MeteorsLiu/llarhub":
+		default:
+			w.WriteHeader(http.StatusNoContent)
 			return
 		}
+		revision = event.GetPullRequest().GetMergeCommitSHA()
 	case *github.PushEvent:
-		handled, err := b.handlePush(r.Context(), delivery, event)
-		if err != nil {
-			log.Printf("bot: generate bindings delivery=%s: %v", delivery, err)
-			http.Error(w, "failed to generate bindings", http.StatusInternalServerError)
+		if event.GetRef() != "refs/heads/c" || event.GetDeleted() {
+			w.WriteHeader(http.StatusNoContent)
 			return
 		}
-		if handled {
-			w.WriteHeader(http.StatusOK)
-			return
-		}
+		repo, revision = event.GetRepo().GetFullName(), event.GetAfter()
+	default:
+		w.WriteHeader(http.StatusNoContent)
+		return
 	}
-	w.WriteHeader(http.StatusNoContent)
+	taskID := github.WebHookType(r) + ":" + repo + "@" + revision
+	task := asynq.NewTaskWithHeaders(github.WebHookType(r), payload, map[string]string{"delivery": delivery})
+	_, err = b.queue.EnqueueContext(r.Context(), task,
+		asynq.Queue(queueName), asynq.TaskID(taskID), asynq.Timeout(80*time.Hour))
+	if err != nil && !errors.Is(err, asynq.ErrTaskIDConflict) {
+		log.Printf("bot: enqueue delivery=%s: %v", delivery, err)
+		http.Error(w, "failed to enqueue event", http.StatusInternalServerError)
+		return
+	}
+	w.WriteHeader(http.StatusAccepted)
+}
+
+func (b *Bot) process(ctx context.Context, task *asynq.Task) error {
+	event, err := github.ParseWebHook(task.Type(), task.Payload())
+	if err != nil {
+		return err
+	}
+	delivery := task.Headers()["delivery"]
+	switch event := event.(type) {
+	case *github.PullRequestEvent:
+		_, err = b.handlePullRequest(ctx, delivery, event)
+	case *github.PushEvent:
+		_, err = b.handlePush(ctx, delivery, event)
+	}
+	if err != nil {
+		log.Printf("bot: process task type=%s delivery=%s: %v", task.Type(), delivery, err)
+	}
+	return err
 }
 
 func (b *Bot) client(installationID int64) *github.Client {
@@ -118,16 +162,7 @@ func (b *Bot) client(installationID int64) *github.Client {
 }
 
 func (b *Bot) handlePullRequest(ctx context.Context, delivery string, event *github.PullRequestEvent) (bool, error) {
-	if event.GetAction() != "closed" || !event.GetPullRequest().GetMerged() ||
-		event.GetPullRequest().GetBase().GetRef() != "main" {
-		return false, nil
-	}
 	repo := event.GetRepo().GetFullName()
-	switch repo {
-	case "llarhub/.index", "MeteorsLiu/llarhub":
-	default:
-		return false, nil
-	}
 	log.Printf("bot: index PR merged repo=%s number=%d installation=%d delivery=%s",
 		repo, event.GetNumber(), event.GetInstallation().GetID(), delivery)
 
@@ -253,9 +288,6 @@ func inspectProjects(ctx context.Context, client *github.Client, owner, index st
 }
 
 func (b *Bot) handlePush(ctx context.Context, delivery string, event *github.PushEvent) (bool, error) {
-	if event.GetRef() != "refs/heads/c" || event.GetDeleted() {
-		return false, nil
-	}
 	repo := event.GetRepo()
 	log.Printf("bot: c branch updated repo=%s sha=%s installation=%d delivery=%s",
 		repo.GetFullName(), event.GetAfter(), event.GetInstallation().GetID(), delivery)

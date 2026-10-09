@@ -28,7 +28,7 @@ func main() {
 	if err != nil {
 		log.Fatal("APP_ID: ", err)
 	}
-	handler, err := bot.New(os.Getenv("WEBHOOK_SECRET"), appID, os.Getenv("PRIVATE_KEY_FILE"))
+	handler, err := bot.New(os.Getenv("WEBHOOK_SECRET"), appID, os.Getenv("PRIVATE_KEY_FILE"), os.Getenv("REDIS_ADDR"))
 	if err != nil {
 		log.Fatal("initialize bot: ", err)
 	}

@@ -37,7 +37,7 @@ func testTOCAggregation(t *testing.T) {
 	var mu sync.Mutex
 	var openHead string
 	var pullCount int
-	bot, _ := newTestBot(t, "secret", func(w http.ResponseWriter, r *http.Request) {
+	bot, _, _ := newTestBot(t, "secret", func(w http.ResponseWriter, r *http.Request) {
 		mu.Lock()
 		defer mu.Unlock()
 		w.Header().Set("Content-Type", "application/json")

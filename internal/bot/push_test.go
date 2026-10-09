@@ -67,7 +67,7 @@ func testPush(t *testing.T) {
 			cHead := testGitCommand(t, remote, "rev-parse", "c")
 
 			var tokenCalls atomic.Int64
-			bot, _ := newTestBot(t, "secret", func(w http.ResponseWriter, r *http.Request) {
+			bot, _, inspector := newTestBot(t, "secret", func(w http.ResponseWriter, r *http.Request) {
 				if r.Method == http.MethodPost && r.URL.Path == fmt.Sprintf("/app/installations/%d/access_tokens", tc.installation) {
 					tokenCalls.Add(1)
 					w.Header().Set("Content-Type", "application/json")
@@ -100,12 +100,13 @@ func testPush(t *testing.T) {
 				request.Header.Set(github.SHA256SignatureHeader, signPayload([]byte("secret"), body))
 				response := httptest.NewRecorder()
 				bot.ServeHTTP(response, request)
-				want := http.StatusOK
-				if tc.failGen {
-					want = http.StatusInternalServerError
-				}
+				want := http.StatusAccepted
 				if response.Code != want {
 					t.Fatalf("push status = %d, want %d: %s", response.Code, want, response.Body.String())
+				}
+				err := waitTask(t, inspector, "push:"+tc.owner+"/libfoo@"+after)
+				if (err != nil) != tc.failGen {
+					t.Fatalf("task error = %v, want failure=%t", err, tc.failGen)
 				}
 			}
 			if tokenCalls.Load() != 1 {
