@@ -29,7 +29,7 @@ func testPush(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			bin := t.TempDir()
-			generator := "#!/bin/sh\nset -eu\n[ -f \"$2/go.mod\" ]\n[ ! -f \"$2/versions.json\" ]\ngrep -Fq '#define LIBFOO_VALUE 1' \"$2/include/foo.h\"\ngrep -Fq '\"Name\":\"foo\"' \"$2/llcppg.cfg\"\ngrep -Fq 'link: $(llar install upstream/libfoo)' \"$2/llcppg.cfg\"\nmkdir -p \"$1/sub\"\nprintf 'package foo\\n\\nconst LLGoPackage = \"link: $(llar install upstream/libfoo)\"\\nconst Value = 1\\n' > \"$1/foo.go\"\nprintf 'package sub\\n\\nconst Value = 2\\n' > \"$1/sub/sub.go\"\n"
+			generator := "#!/bin/sh\nset -eu\n[ -f \"$2/go.mod\" ]\n[ ! -f \"$2/versions.json\" ]\ngrep -Fq '#define LIBFOO_VALUE 1' \"$2/include/foo.h\"\ngrep -Fq '\"Name\":\"foo\"' \"$2/llcppg.cfg\"\ngrep -Fq 'link: $(pkg-config --libs foo)' \"$2/llcppg.cfg\"\nmkdir -p \"$1/sub\"\nprintf 'package foo\\n\\nconst LLGoPackage = \"link: $(pkg-config --libs foo)\"\\nconst Value = 1\\n' > \"$1/foo.go\"\nprintf 'package sub\\n\\nconst Value = 2\\n' > \"$1/sub/sub.go\"\n"
 			if tc.failGen {
 				generator = "#!/bin/sh\nexit 7\n"
 			}
@@ -45,7 +45,7 @@ func testPush(t *testing.T) {
 			baseSHA := testGitCommand(t, remote, "rev-parse", tc.base)
 			testGitCommand(t, checkout, "checkout", "-b", "c")
 			sourceModule := "module github.com/" + tc.owner + "/libfoo/c\n\ngo 1.24.0\n"
-			cfg := "{\"Name\":\"foo\",\"Language\":\"c\",\"Dir\":\"./include\",\"LLGoPackage\":\"link: $(llar install upstream/libfoo)\"}"
+			cfg := "{\"Name\":\"foo\",\"Language\":\"c\",\"Dir\":\"./include\",\"LLGoPackage\":\"link: $(pkg-config --libs foo)\"}"
 			testWriteFiles(t, checkout, map[string]string{
 				"c/go.mod":        sourceModule,
 				"c/llcppg.cfg":    cfg,
@@ -128,7 +128,7 @@ func testPush(t *testing.T) {
 				return
 			}
 			for name, want := range map[string]string{
-				"foo.go":     "package foo\n\nconst LLGoPackage = \"link: $(llar install upstream/libfoo)\"\nconst Value = 1",
+				"foo.go":     "package foo\n\nconst LLGoPackage = \"link: $(pkg-config --libs foo)\"\nconst Value = 1",
 				"sub/sub.go": "package sub\n\nconst Value = 2",
 				"README.md":  "keep documentation",
 			} {

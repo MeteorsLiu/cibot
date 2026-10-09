@@ -2,7 +2,6 @@ package bot
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"os"
 	"os/exec"
@@ -30,23 +29,6 @@ func (b *Bot) provision(ctx context.Context, client *github.Client, indexRepo *g
 	}
 
 	sourceDir := filepath.Join(dir, "source")
-	configPath := filepath.Join(sourceDir, "llcppg.cfg")
-	data, err := os.ReadFile(configPath)
-	if err != nil {
-		return err
-	}
-	var config map[string]json.RawMessage
-	if err := json.Unmarshal(data, &config); err != nil {
-		return err
-	}
-	config["LLGoPackage"], _ = json.Marshal("link: $(llar install " + project.source + ")")
-	data, err = json.Marshal(config)
-	if err != nil {
-		return err
-	}
-	if err := os.WriteFile(configPath, data, 0644); err != nil {
-		return err
-	}
 	nativeDir := filepath.Join(dir, "native")
 	if err := run(ctx, sourceDir, "llar", "install", project.source, "-o", nativeDir); err != nil {
 		return err

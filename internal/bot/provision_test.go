@@ -10,7 +10,6 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
-	"reflect"
 	"strings"
 	"sync"
 	"testing"
@@ -24,11 +23,13 @@ func testProvision(t *testing.T) {
 		name, owner, index, ownerType, base string
 		existing, cBranch, failGen, repeat  bool
 		failInit                            bool
+		llvmConfig                          bool
 		mainTag, cTag                       bool
 		toc                                 string
 	}{
 		{name: "new personal repository", owner: "MeteorsLiu", index: "llarhub", ownerType: "User", base: "main"},
 		{name: "new organization repository", owner: "llarhub", index: ".index", ownerType: "Organization", base: "main"},
+		{name: "llvm-config configuration", owner: "MeteorsLiu", index: "llarhub", ownerType: "User", base: "main", llvmConfig: true},
 		{name: "existing repository", owner: "MeteorsLiu", index: "llarhub", ownerType: "User", base: "main", existing: true, cBranch: true, mainTag: true, cTag: true},
 		{name: "existing repository without c branch", owner: "MeteorsLiu", index: "llarhub", ownerType: "User", base: "trunk", existing: true, mainTag: true, cTag: true},
 		{name: "resume after repository creation", owner: "MeteorsLiu", index: "llarhub", ownerType: "User", base: "main", existing: true},
@@ -44,6 +45,12 @@ func testProvision(t *testing.T) {
 			workRoot := t.TempDir()
 			t.Setenv("TMPDIR", workRoot)
 			bin := t.TempDir()
+			llgoPackage := "link: $(pkg-config --libs foo)"
+			cflags := "$(pkg-config --cflags foo)"
+			if tc.llvmConfig {
+				llgoPackage = "link: -L$(llvm-config --libdir) -lclang"
+				cflags = "$(llvm-config --cflags)"
+			}
 			llar := "#!/bin/sh\nset -eu\n[ \"$1\" = install ]\n[ \"$2\" = upstream/libfoo ]\n[ \"$3\" = -o ]\n[ -z \"$(printenv CIBOT_GIT_AUTH)\" ]\nmkdir -p \"$4/include\"\nprintf '#define LIBFOO_VALUE 1\\n' > \"$4/include/foo.h\"\n"
 			llcppg := "#!/bin/sh\nset -eu\n[ -z \"$(printenv CIBOT_GIT_AUTH)\" ]\n"
 			if tc.existing {
@@ -73,14 +80,14 @@ fi
 			if tc.failGen {
 				llcppg += "exit 7\n"
 			}
-			llcppg += "[ -f \"$2/go.mod\" ]\n[ -f \"$2/include/foo.h\" ]\ngrep -q '\"Name\":\"foo\"' \"$2/llcppg.cfg\"\ngrep -Fq '\"LLGoPackage\":\"link: $(llar install upstream/libfoo)\"' \"$2/llcppg.cfg\"\nmkdir -p \"$1\"\nprintf 'package foo\\n\\nconst LLGoPackage = \"link: $(llar install upstream/libfoo)\"\\nconst Value = 1\\n' > \"$1/foo.go\"\n"
+			llcppg += fmt.Sprintf("[ -f \"$2/go.mod\" ]\n[ -f \"$2/include/foo.h\" ]\ngrep -q '\"Name\":\"foo\"' \"$2/llcppg.cfg\"\ngrep -Fq '\"LLGoPackage\":\"%s\"' \"$2/llcppg.cfg\"\ngrep -Fq '\"CFlags\":\"%s\"' \"$2/llcppg.cfg\"\nmkdir -p \"$1\"\nprintf 'package foo\\n\\nconst LLGoPackage = \"%s\"\\nconst Value = 1\\n' > \"$1/foo.go\"\n", llgoPackage, cflags, llgoPackage)
 			for name, script := range map[string]string{"llar": llar, "llcppg": llcppg} {
 				if err := os.WriteFile(filepath.Join(bin, name), []byte(script), 0755); err != nil {
 					t.Fatal(err)
 				}
 			}
 			t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
-			cfg := "{\"Name\":\"foo\",\"Language\":\"c\",\"Dir\":\"./include\",\"FuncPrefix\":[\"foo_\"],\"LLGoPackage\":\"link: -lold\"}"
+			cfg := fmt.Sprintf("{\"Name\":\"foo\",\"Language\":\"c\",\"Dir\":\"./include\",\"FuncPrefix\":[\"foo_\"],\"LLGoPackage\":%q,\"CFlags\":%q}\n", llgoPackage, cflags)
 			module := "module github.com/" + tc.owner + "/libfoo/c\n\ngo 1.23\n\nrequire github.com/goplus/lib v0.6.1\n"
 			if tc.cBranch {
 				module = "module github.com/" + tc.owner + "/libfoo/c\n\ngo 1.24.0\n"
@@ -288,24 +295,16 @@ fi
 			for name, want := range map[string]string{
 				"c:c/go.mod":           module,
 				"c:c/include/foo.h":    "#define LIBFOO_VALUE 1\n",
-				tc.base + ":foo.go":    "package foo\n\nconst LLGoPackage = \"link: $(llar install upstream/libfoo)\"\nconst Value = 1\n",
+				tc.base + ":foo.go":    fmt.Sprintf("package foo\n\nconst LLGoPackage = %q\nconst Value = 1\n", llgoPackage),
 				tc.base + ":README.md": "keep project documentation\n",
 			} {
 				if got := testGitCommand(t, projectRemote, "show", name); got != strings.TrimSpace(want) {
 					t.Fatalf("%s = %q, want %q", name, got, want)
 				}
 			}
-			var gotConfig, wantConfig map[string]any
 			publishedConfig := testGitCommand(t, projectRemote, "show", "c:c/llcppg.cfg")
-			if err := json.Unmarshal([]byte(publishedConfig), &gotConfig); err != nil {
-				t.Fatal(err)
-			}
-			if err := json.Unmarshal([]byte(cfg), &wantConfig); err != nil {
-				t.Fatal(err)
-			}
-			wantConfig["LLGoPackage"] = "link: $(llar install upstream/libfoo)"
-			if !reflect.DeepEqual(gotConfig, wantConfig) {
-				t.Fatalf("published configuration = %v, want %v", gotConfig, wantConfig)
+			if publishedConfig != strings.TrimSpace(cfg) {
+				t.Fatalf("published configuration = %q, want %q", publishedConfig, cfg)
 			}
 			if got := testGitCommand(t, projectRemote, "show", tc.base+":go.mod"); !strings.Contains(got, "module github.com/"+tc.owner+"/libfoo\n") {
 				t.Fatalf("incorrect generated module: %s", got)
