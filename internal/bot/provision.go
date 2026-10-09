@@ -71,8 +71,20 @@ func (b *Bot) provision(ctx context.Context, client *github.Client, indexRepo *g
 		return err
 	}
 	cDir := filepath.Join(repoDir, "c")
-	if err := copyDirectory(sourceDir, cDir); err != nil {
+	if err := os.MkdirAll(cDir, 0755); err != nil {
 		return err
+	}
+	entries, err := os.ReadDir(sourceDir)
+	if err != nil {
+		return err
+	}
+	for _, entry := range entries {
+		switch name := entry.Name(); name {
+		case "llcppg.cfg", "include", "go.mod", "go.sum":
+			if err := copyDirectory(filepath.Join(sourceDir, name), filepath.Join(cDir, name)); err != nil {
+				return err
+			}
+		}
 	}
 	modulePath := "github.com/" + owner + "/" + project.name
 	if !isNew && cBranch == "" {

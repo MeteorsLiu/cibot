@@ -24,12 +24,15 @@ func testProvision(t *testing.T) {
 		existing, cBranch, failGen, repeat  bool
 		failInit                            bool
 		llvmConfig                          bool
+		moduleFiles                         bool
 		mainTag, cTag                       bool
 		toc                                 string
 	}{
 		{name: "new personal repository", owner: "MeteorsLiu", index: "llarhub", ownerType: "User", base: "main"},
 		{name: "new organization repository", owner: "llarhub", index: ".index", ownerType: "Organization", base: "main"},
 		{name: "llvm-config configuration", owner: "MeteorsLiu", index: "llarhub", ownerType: "User", base: "main", llvmConfig: true},
+		{name: "copy supplied module files into template", owner: "MeteorsLiu", index: "llarhub", ownerType: "User", base: "main", moduleFiles: true},
+		{name: "copy supplied module files into existing c branch", owner: "MeteorsLiu", index: "llarhub", ownerType: "User", base: "main", existing: true, cBranch: true, moduleFiles: true},
 		{name: "existing repository", owner: "MeteorsLiu", index: "llarhub", ownerType: "User", base: "main", existing: true, cBranch: true, mainTag: true, cTag: true},
 		{name: "existing repository without c branch", owner: "MeteorsLiu", index: "llarhub", ownerType: "User", base: "trunk", existing: true, mainTag: true, cTag: true},
 		{name: "resume after repository creation", owner: "MeteorsLiu", index: "llarhub", ownerType: "User", base: "main", existing: true},
@@ -80,6 +83,7 @@ fi
 			if tc.failGen {
 				llcppg += "exit 7\n"
 			}
+			llcppg += "[ ! -e \"$2/versions.json\" ]\n[ ! -e \"$2/v1.0\" ]\n[ ! -e \"$2/README.md\" ]\n[ ! -e \"$2/extra.cfg\" ]\n[ -f \"$2/include/custom/extra.h\" ]\n"
 			llcppg += fmt.Sprintf("[ -f \"$2/go.mod\" ]\n[ -f \"$2/include/foo.h\" ]\ngrep -q '\"Name\":\"foo\"' \"$2/llcppg.cfg\"\ngrep -Fq '\"LLGoPackage\":\"%s\"' \"$2/llcppg.cfg\"\ngrep -Fq '\"CFlags\":\"%s\"' \"$2/llcppg.cfg\"\nmkdir -p \"$1\"\nprintf 'package foo\\n\\nconst LLGoPackage = \"%s\"\\nconst Value = 1\\n' > \"$1/foo.go\"\n", llgoPackage, cflags, llgoPackage)
 			for name, script := range map[string]string{"llar": llar, "llcppg": llcppg} {
 				if err := os.WriteFile(filepath.Join(bin, name), []byte(script), 0755); err != nil {
@@ -92,11 +96,23 @@ fi
 			if tc.cBranch {
 				module = "module github.com/" + tc.owner + "/libfoo/c\n\ngo 1.24.0\n"
 			}
+			sum := "github.com/goplus/lib v0.6.1 h1:OrHX3lBRsK3u5Vh045bkPvCoYHXhLmEqPCINHT6qA6Y=\ngithub.com/goplus/lib v0.6.1/go.mod h1:0krESx2ZyKMlgNp3oUMob++WJYR5a1PpubjSmMjnP0c=\n"
 			files := map[string]string{
-				"libfoo/versions.json": "{\"path\":\"upstream/libfoo\"}",
-				"libfoo/llcppg.cfg":    cfg,
-				"README.md":            "registry\n",
-				"unused/data.txt":      "unrelated project contents\n",
+				"libfoo/versions.json":          "{\"path\":\"upstream/libfoo\"}",
+				"libfoo/llcppg.cfg":             cfg,
+				"libfoo/include/custom/extra.h": "#define EXTRA_VALUE 2\n",
+				"libfoo/v1.0/libfoo_llar.gox":   "id \"upstream/libfoo\"\n",
+				"libfoo/v1.0/consumer.c":        "int main(void) { return 0; }\n",
+				"libfoo/README.md":              "recipe documentation\n",
+				"libfoo/extra.cfg":              "index-only configuration\n",
+				"libfoo/keep.txt":               "must not overwrite the existing C file\n",
+				"README.md":                     "registry\n",
+				"unused/data.txt":               "unrelated project contents\n",
+			}
+			if tc.moduleFiles {
+				module = "module github.com/" + tc.owner + "/libfoo/c\n\ngo 1.24.0\n\nrequire github.com/goplus/lib v0.6.1\n"
+				files["libfoo/go.mod"] = module
+				files["libfoo/go.sum"] = sum
 			}
 			if tc.toc != "" {
 				files["llarhub.toc"] = tc.toc
@@ -120,7 +136,11 @@ fi
 			cParent := mainParent
 			if tc.cBranch {
 				testGitCommand(t, projectCheckout, "checkout", "-b", "c")
-				testWriteFiles(t, projectCheckout, map[string]string{"c/go.mod": module, "c/llcppg.cfg": "old configuration", "c/include/foo.h": "old header", "c/keep.txt": "keep\n"})
+				existingModule := module
+				if tc.moduleFiles {
+					existingModule = "module github.com/" + tc.owner + "/libfoo/c\n\ngo 1.23\n"
+				}
+				testWriteFiles(t, projectCheckout, map[string]string{"c/go.mod": existingModule, "c/llcppg.cfg": "old configuration", "c/include/foo.h": "old header", "c/keep.txt": "keep\n"})
 				testGitCommand(t, projectCheckout, "add", "--all")
 				testGitCommand(t, projectCheckout, "commit", "-m", "Existing C source")
 				testGitCommand(t, projectCheckout, "push", "origin", "c")
@@ -293,10 +313,11 @@ fi
 				return
 			}
 			for name, want := range map[string]string{
-				"c:c/go.mod":           module,
-				"c:c/include/foo.h":    "#define LIBFOO_VALUE 1\n",
-				tc.base + ":foo.go":    fmt.Sprintf("package foo\n\nconst LLGoPackage = %q\nconst Value = 1\n", llgoPackage),
-				tc.base + ":README.md": "keep project documentation\n",
+				"c:c/go.mod":                 module,
+				"c:c/include/foo.h":          "#define LIBFOO_VALUE 1\n",
+				"c:c/include/custom/extra.h": "#define EXTRA_VALUE 2\n",
+				tc.base + ":foo.go":          fmt.Sprintf("package foo\n\nconst LLGoPackage = %q\nconst Value = 1\n", llgoPackage),
+				tc.base + ":README.md":       "keep project documentation\n",
 			} {
 				if got := testGitCommand(t, projectRemote, "show", name); got != strings.TrimSpace(want) {
 					t.Fatalf("%s = %q, want %q", name, got, want)
@@ -311,6 +332,22 @@ fi
 			}
 			if tc.cBranch && testGitCommand(t, projectRemote, "show", "c:c/keep.txt") != "keep" {
 				t.Fatal("publication removed unrelated C files")
+			}
+			if !tc.cBranch || tc.moduleFiles {
+				if got := testGitCommand(t, projectRemote, "show", "c:c/go.sum"); got != strings.TrimSpace(sum) {
+					t.Fatalf("published go.sum = %q, want %q", got, strings.TrimSpace(sum))
+				}
+			}
+			for _, name := range strings.Split(testGitCommand(t, projectRemote, "ls-tree", "--name-only", "c:c"), "\n") {
+				switch name {
+				case "llcppg.cfg", "include", "go.mod", "go.sum":
+					continue
+				case "keep.txt":
+					if tc.cBranch {
+						continue
+					}
+				}
+				t.Fatalf("publication copied an unexpected entry into c/: %s", name)
 			}
 			commits := deliveries
 			if !tc.existing {
