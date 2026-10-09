@@ -25,6 +25,8 @@ type Bot struct {
 	clients   map[int64]*github.Client
 	// tocMu serializes the open-PR lookup and toc update across deliveries.
 	tocMu sync.Mutex
+	// initMu protects llcppg's shared template cache across new repositories.
+	initMu sync.Mutex
 }
 
 var _ http.Handler = (*Bot)(nil)
@@ -175,7 +177,7 @@ func (b *Bot) handlePullRequest(ctx context.Context, delivery string, event *git
 		return true, err
 	}
 	for _, project := range projects {
-		if err := provision(ctx, client, event.GetRepo(), project, filepath.Join(workDir, "projects", project.name)); err != nil {
+		if err := b.provision(ctx, client, event.GetRepo(), project, filepath.Join(workDir, "projects", project.name)); err != nil {
 			return true, fmt.Errorf("provision %s: %w", project.name, err)
 		}
 	}

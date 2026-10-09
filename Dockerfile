@@ -10,7 +10,7 @@ RUN --mount=type=cache,target=/go/pkg/mod --mount=type=cache,target=/root/.cache
 
 FROM golang:1.27-bookworm@sha256:8d48e12ec56735e9358640898b9d9b9fcca110612ed8a5567438c0a1baa24e66 AS runtime
 ARG LLAR_REF=36ba7c64a7ccbb67e37731e34d828360650c65f6
-ARG LLCPPG_REF=eab9d507626d403a77578ba1ab78099e69e48d9f
+ARG LLCPPG_REF=c01757554a9fddd817a77369e347795c32955f9a
 ARG LLGO_REF=b86d349178d610e6b15e95c2a5fdfcb130d09fa1
 ENV LLGO_ROOT=/opt/llgo \
     PATH="/usr/local/bin:/usr/lib/llvm-22/bin:${PATH}"
