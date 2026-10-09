@@ -3,6 +3,7 @@ package bot
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -15,6 +16,7 @@ import (
 	"time"
 
 	"github.com/google/go-github/v83/github"
+	"github.com/hibiken/asynq"
 )
 
 func testTOCAggregation(t *testing.T) {
@@ -64,9 +66,11 @@ func testTOCAggregation(t *testing.T) {
 			if openHead == "" {
 				io.WriteString(w, "[]")
 			} else {
-				pull := &github.PullRequest{Head: &github.PullRequestBranch{Ref: github.Ptr(openHead), Repo: &github.Repository{FullName: github.Ptr(owner + "/" + index)}}}
+				pull := &github.PullRequest{Number: github.Ptr(pullCount + 1), Head: &github.PullRequestBranch{Ref: github.Ptr(openHead), Repo: &github.Repository{FullName: github.Ptr(owner + "/" + index)}}}
 				json.NewEncoder(w).Encode([]*github.PullRequest{pull})
 			}
+		case r.Method == http.MethodGet && r.URL.Path == fmt.Sprintf("%s/pulls/%d", prefix, pullCount+1):
+			io.WriteString(w, `{"state":"open","merged":false}`)
 		case r.Method == http.MethodPost && r.URL.Path == prefix+"/pulls":
 			var request github.NewPullRequest
 			if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
@@ -77,7 +81,7 @@ func testTOCAggregation(t *testing.T) {
 			}
 			openHead = request.GetHead()
 			pullCount++
-			io.WriteString(w, "{\"number\":2}")
+			fmt.Fprintf(w, `{"number":%d}`, pullCount+1)
 		default:
 			t.Errorf("unexpected toc request: %s %s", r.Method, r.URL.Path)
 			w.WriteHeader(http.StatusNotFound)
@@ -174,5 +178,159 @@ func testTOCAggregation(t *testing.T) {
 		if strings.Count(content+"\n", record+"\n") != 1 {
 			t.Fatalf("toc lost or duplicated %q: %q", record, content)
 		}
+	}
+
+	for _, tc := range []struct {
+		name                          string
+		merged, includesUpdate        bool
+		alreadyAdded, lookupFailsOnce bool
+	}{
+		{name: "merged before push", merged: true},
+		{name: "merged with the pushed update", merged: true, includesUpdate: true},
+		{name: "duplicate still checks PR state", merged: true, alreadyAdded: true},
+		{name: "closed without merging"},
+		{name: "state lookup fails after push", lookupFailsOnce: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			const oldBranch = "llarhub-bot/toc-pr-3"
+			const baseTOC = "old/native old\n"
+			const pendingTOC = baseTOC + "upstream/foo foo\n"
+			const updatedTOC = pendingTOC + "upstream/bar bar\n"
+			remote, source := testRepository(t, "main", map[string]string{"llarhub.toc": baseTOC, "README.md": "keep\n"})
+			initialMain := testGitCommand(t, remote, "rev-parse", "main")
+			testGitCommand(t, source, "checkout", "-b", oldBranch)
+			testWriteFiles(t, source, map[string]string{"llarhub.toc": pendingTOC})
+			testGitCommand(t, source, "commit", "-am", "Existing pending mapping")
+			beforeAddition := testGitCommand(t, source, "rev-parse", "HEAD")
+			if tc.alreadyAdded {
+				testWriteFiles(t, source, map[string]string{"llarhub.toc": updatedTOC})
+				testGitCommand(t, source, "commit", "-am", "Earlier delivery added the mapping")
+			}
+			testGitCommand(t, source, "push", "origin", oldBranch)
+			branchBefore := testGitCommand(t, remote, "rev-parse", oldBranch)
+
+			var stateMu sync.Mutex
+			var closed bool
+			var stateReads, created int
+			var newHead string
+			bot, _, _ := newTestBot(t, "secret", func(w http.ResponseWriter, r *http.Request) {
+				stateMu.Lock()
+				defer stateMu.Unlock()
+				w.Header().Set("Content-Type", "application/json")
+				switch {
+				case r.Method == http.MethodPost && r.URL.Path == "/app/installations/7/access_tokens":
+					fmt.Fprintf(w, `{"token":"installation-7","expires_at":%q}`, time.Now().Add(time.Hour).UTC().Format(time.RFC3339))
+				case r.Method == http.MethodGet && r.URL.Path == prefix+"/pulls":
+					if closed {
+						io.WriteString(w, `[]`)
+						return
+					}
+					fmt.Fprintf(w, `[{"number":7,"head":{"ref":%q,"repo":{"full_name":%q}}}]`, oldBranch, owner+"/"+index)
+					if tc.merged && !tc.includesUpdate {
+						// The list response is already stale when the caller fetches
+						// this branch: main received only the earlier PR contents.
+						testGitCommand(t, remote, "update-ref", "refs/heads/main", beforeAddition)
+						closed = true
+					}
+				case r.Method == http.MethodGet && r.URL.Path == prefix+"/pulls/7":
+					stateReads++
+					if got := testGitCommand(t, remote, "show", oldBranch+":llarhub.toc"); got != strings.TrimSpace(updatedTOC) {
+						t.Errorf("PR state was checked before the branch contained the update: %q", got)
+					}
+					if tc.lookupFailsOnce {
+						if stateReads == 1 {
+							w.WriteHeader(http.StatusInternalServerError)
+							io.WriteString(w, `{"message":"state lookup unavailable"}`)
+						} else {
+							io.WriteString(w, `{"state":"open","merged":false}`)
+						}
+						return
+					}
+					if tc.includesUpdate {
+						testGitCommand(t, remote, "update-ref", "refs/heads/main", oldBranch)
+					}
+					closed = true
+					fmt.Fprintf(w, `{"state":"closed","merged":%t}`, tc.merged)
+				case r.Method == http.MethodPost && r.URL.Path == prefix+"/pulls":
+					var request github.NewPullRequest
+					if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+						t.Error(err)
+					}
+					newHead = request.GetHead()
+					created++
+					if newHead == oldBranch || request.GetBase() != "main" {
+						t.Error("retry reused the merged PR branch or changed the base")
+					}
+					io.WriteString(w, `{"number":10}`)
+				default:
+					t.Errorf("unexpected API request: %s %s", r.Method, r.URL.Path)
+					w.WriteHeader(http.StatusNotFound)
+				}
+			})
+			client := bot.client(7)
+			projects := []project{{name: "bar", source: "upstream/bar"}}
+			dir := filepath.Join(t.TempDir(), "index")
+			testGitCommand(t, "", "clone", "--no-checkout", remote, dir)
+			err := bot.updateTOC(ctx, client, owner, index, 9, projects, dir)
+			if err == nil {
+				t.Fatal("closed PR or failed state lookup was reported as success")
+			}
+			if !tc.merged && !tc.lookupFailsOnce {
+				if !errors.Is(err, asynq.SkipRetry) {
+					t.Fatalf("manual close must stop automatic retries: %v", err)
+				}
+				if testGitCommand(t, remote, "rev-parse", "main") != initialMain {
+					t.Fatal("manual close changed main")
+				}
+				stateMu.Lock()
+				defer stateMu.Unlock()
+				if created != 0 || stateReads != 1 {
+					t.Fatalf("manual close: created=%d state reads=%d", created, stateReads)
+				}
+				return
+			}
+			if errors.Is(err, asynq.SkipRetry) {
+				t.Fatalf("merged PR or failed read must remain retryable: %v", err)
+			}
+			if tc.merged && !strings.Contains(err.Error(), "merged during update") {
+				t.Fatalf("expected merged PR error, got %v", err)
+			}
+			branchAfter := testGitCommand(t, remote, "rev-parse", oldBranch)
+			if tc.alreadyAdded && branchAfter != branchBefore {
+				t.Fatal("duplicate mapping created another commit")
+			}
+
+			// Simulate the next Asynq attempt with a fresh clone, as the PR handler does.
+			retryDir := filepath.Join(t.TempDir(), "index")
+			testGitCommand(t, "", "clone", "--no-checkout", remote, retryDir)
+			if err := bot.updateTOC(ctx, client, owner, index, 9, projects, retryDir); err != nil {
+				t.Fatal(err)
+			}
+			stateMu.Lock()
+			defer stateMu.Unlock()
+			switch {
+			case tc.lookupFailsOnce:
+				if created != 0 || stateReads != 2 || testGitCommand(t, remote, "rev-parse", oldBranch) != branchAfter {
+					t.Fatalf("lookup retry changed the branch or opened a PR: created=%d state reads=%d", created, stateReads)
+				}
+			case tc.includesUpdate:
+				if created != 0 || stateReads != 1 || testGitCommand(t, remote, "show", "main:llarhub.toc") != strings.TrimSpace(updatedTOC) {
+					t.Fatal("already merged mappings were resubmitted")
+				}
+			default:
+				if created != 1 || stateReads != 1 || newHead != "llarhub-bot/toc-pr-9" {
+					t.Fatalf("missing mappings did not get one new PR: created=%d state reads=%d head=%q", created, stateReads, newHead)
+				}
+				if testGitCommand(t, remote, "rev-parse", newHead+"^") != testGitCommand(t, remote, "rev-parse", "main") {
+					t.Fatal("retry did not start from latest main")
+				}
+				if got := testGitCommand(t, remote, "show", newHead+":llarhub.toc"); got != strings.TrimSpace(updatedTOC) {
+					t.Fatalf("retry lost or duplicated records: %q", got)
+				}
+				if changed := testGitCommand(t, remote, "diff", "--name-only", "main", newHead); changed != "llarhub.toc" {
+					t.Fatalf("retry modified unrelated files: %s", changed)
+				}
+			}
+		})
 	}
 }

@@ -289,10 +289,32 @@ func inspectProjects(ctx context.Context, client *github.Client, owner, index st
 
 func (b *Bot) handlePush(ctx context.Context, delivery string, event *github.PushEvent) (bool, error) {
 	repo := event.GetRepo()
+	owner, project, _ := strings.Cut(repo.GetFullName(), "/")
+	var index string
+	switch owner {
+	case "llarhub":
+		index = ".index"
+	case "MeteorsLiu":
+		index = "llarhub"
+	default:
+		return false, nil
+	}
+	client := b.client(event.GetInstallation().GetID())
+	// A project's first c push can arrive before its toc PR is merged.
+	// Its registration, e.g. zlib/versions.json, is already on the index's main.
+	registration, _, response, err := client.Repositories.GetContents(ctx, owner, index, project+"/versions.json", &github.RepositoryContentGetOptions{Ref: "main"})
+	if err != nil {
+		if response != nil && response.StatusCode == http.StatusNotFound {
+			return false, nil
+		}
+		return true, fmt.Errorf("inspect registration %s/%s/%s: %w", owner, index, project, err)
+	}
+	if registration.GetType() != "file" {
+		return false, nil
+	}
 	log.Printf("bot: c branch updated repo=%s sha=%s installation=%d delivery=%s",
 		repo.GetFullName(), event.GetAfter(), event.GetInstallation().GetID(), delivery)
 
-	client := b.client(event.GetInstallation().GetID())
 	workDir, err := os.MkdirTemp("", "cibot-push-")
 	if err != nil {
 		return true, err
@@ -300,6 +322,18 @@ func (b *Bot) handlePush(ctx context.Context, delivery string, event *github.Pus
 	defer os.RemoveAll(workDir)
 	repoDir := filepath.Join(workDir, "repo")
 	if _, err := git(ctx, client, workDir, "clone", "--quiet", "--no-checkout", repo.GetCloneURL(), repoDir); err != nil {
+		return true, err
+	}
+	cHead, err := git(ctx, client, repoDir, "rev-parse", "refs/remotes/origin/c")
+	if err != nil {
+		return true, err
+	}
+	if cHead != event.GetAfter() {
+		return true, fmt.Errorf("cancel c push for %s: c HEAD changed from %s to %s: %w", repo.GetFullName(), event.GetAfter(), cHead, asynq.SkipRetry)
+	}
+	base := repo.GetDefaultBranch()
+	baseHead, err := git(ctx, client, repoDir, "rev-parse", "refs/remotes/origin/"+base)
+	if err != nil {
 		return true, err
 	}
 	if _, err := git(ctx, client, repoDir, "checkout", "--quiet", "--detach", event.GetAfter()); err != nil {
@@ -313,7 +347,6 @@ func (b *Bot) handlePush(ctx context.Context, delivery string, event *github.Pus
 	if err := generate(ctx, sourceDir, outputDir, "github.com/"+repo.GetFullName()); err != nil {
 		return true, err
 	}
-	base := repo.GetDefaultBranch()
 	if _, err := git(ctx, client, repoDir, "checkout", "--quiet", base); err != nil {
 		return true, err
 	}
@@ -326,6 +359,38 @@ func (b *Bot) handlePush(ctx context.Context, delivery string, event *github.Pus
 	if _, err := git(ctx, client, repoDir, "commit", "--quiet", "--allow-empty", "-m", "Generate LLGo bindings from c@"+event.GetAfter()); err != nil {
 		return true, err
 	}
+	commit, err := git(ctx, client, repoDir, "rev-parse", "HEAD")
+	if err != nil {
+		return true, err
+	}
+	heads, err := git(ctx, client, repoDir, "ls-remote", "origin", "refs/heads/c", "refs/heads/"+base)
+	if err != nil {
+		return true, err
+	}
+	var currentC, currentBase string
+	for _, line := range strings.Split(heads, "\n") {
+		sha, ref, _ := strings.Cut(line, "\t")
+		switch ref {
+		case "refs/heads/c":
+			currentC = sha
+		case "refs/heads/" + base:
+			currentBase = sha
+		}
+	}
+	if currentC != cHead || currentBase != baseHead {
+		return true, fmt.Errorf("cancel c push for %s: c or %s HEAD changed during generation: %w", repo.GetFullName(), base, asynq.SkipRetry)
+	}
 	_, err = git(ctx, client, repoDir, "push", "origin", "HEAD:refs/heads/"+base)
+	if err != nil {
+		// A writer can advance the target after ls-remote but before our push.
+		// Do not retry against that new head; unrelated push errors still retry.
+		head, readErr := git(ctx, client, repoDir, "ls-remote", "origin", "refs/heads/"+base)
+		if readErr == nil {
+			sha, _, _ := strings.Cut(head, "\t")
+			if sha != baseHead && sha != commit {
+				return true, fmt.Errorf("cancel c push for %s: %s HEAD changed during push (%v): %w", repo.GetFullName(), base, err, asynq.SkipRetry)
+			}
+		}
+	}
 	return true, err
 }

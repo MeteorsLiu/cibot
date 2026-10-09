@@ -10,6 +10,7 @@ import (
 
 	"github.com/MeteorsLiu/cibot/internal/toc"
 	"github.com/google/go-github/v83/github"
+	"github.com/hibiken/asynq"
 )
 
 func (b *Bot) updateTOC(ctx context.Context, client *github.Client, owner, index string, number int, projects []project, dir string) error {
@@ -72,19 +73,33 @@ func (b *Bot) updateTOC(ctx context.Context, client *github.Client, owner, index
 		}
 		changed = changed || added
 	}
-	if !changed {
+	if !changed && pending == nil {
 		return nil
 	}
-	if _, err := git(ctx, client, dir, "add", "--", "llarhub.toc"); err != nil {
-		return err
-	}
-	if _, err := git(ctx, client, dir, "commit", "--quiet", "-m", fmt.Sprintf("Update llarhub.toc for PR #%d", number)); err != nil {
-		return err
-	}
-	if _, err := git(ctx, client, dir, "push", "origin", "HEAD:refs/heads/"+branch); err != nil {
-		return err
+	if changed {
+		if _, err := git(ctx, client, dir, "add", "--", "llarhub.toc"); err != nil {
+			return err
+		}
+		if _, err := git(ctx, client, dir, "commit", "--quiet", "-m", fmt.Sprintf("Update llarhub.toc for PR #%d", number)); err != nil {
+			return err
+		}
+		if _, err := git(ctx, client, dir, "push", "origin", "HEAD:refs/heads/"+branch); err != nil {
+			return err
+		}
 	}
 	if pending != nil {
+		// The user may have merged this PR after we selected its branch. A retry
+		// starts from main and Add restores only the mappings that did not merge.
+		pull, _, err := client.PullRequests.Get(ctx, owner, index, pending.GetNumber())
+		if err != nil {
+			return err
+		}
+		if pull.GetMerged() {
+			return fmt.Errorf("toc PR %s/%s#%d merged during update; retry from main", owner, index, pending.GetNumber())
+		}
+		if pull.GetState() == "closed" {
+			return fmt.Errorf("toc PR %s/%s#%d closed without merging: %w", owner, index, pending.GetNumber(), asynq.SkipRetry)
+		}
 		return nil
 	}
 	pull, _, err := client.PullRequests.Create(ctx, owner, index, &github.NewPullRequest{
