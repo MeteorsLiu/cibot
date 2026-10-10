@@ -315,6 +315,14 @@ func (b *Bot) handlePush(ctx context.Context, delivery string, event *github.Pus
 	log.Printf("bot: c branch updated repo=%s sha=%s installation=%d delivery=%s",
 		repo.GetFullName(), event.GetAfter(), event.GetInstallation().GetID(), delivery)
 
+	tags, err := git(ctx, client, "", "ls-remote", "--tags", "--refs", repo.GetCloneURL())
+	if err != nil {
+		return true, err
+	}
+	if tags != "" {
+		log.Printf("bot: skip c push repo=%s: repository has tags", repo.GetFullName())
+		return true, nil
+	}
 	workDir, err := os.MkdirTemp("", "cibot-push-")
 	if err != nil {
 		return true, err
@@ -363,17 +371,20 @@ func (b *Bot) handlePush(ctx context.Context, delivery string, event *github.Pus
 	if err != nil {
 		return true, err
 	}
-	heads, err := git(ctx, client, repoDir, "ls-remote", "origin", "refs/heads/c", "refs/heads/"+base)
+	heads, err := git(ctx, client, repoDir, "ls-remote", "--refs", "origin", "refs/heads/c", "refs/heads/"+base, "refs/tags/*")
 	if err != nil {
 		return true, err
 	}
 	var currentC, currentBase string
 	for _, line := range strings.Split(heads, "\n") {
 		sha, ref, _ := strings.Cut(line, "\t")
-		switch ref {
-		case "refs/heads/c":
+		switch {
+		case strings.HasPrefix(ref, "refs/tags/"):
+			log.Printf("bot: skip c push repo=%s: repository has tags before publication", repo.GetFullName())
+			return true, nil
+		case ref == "refs/heads/c":
 			currentC = sha
-		case "refs/heads/" + base:
+		case ref == "refs/heads/"+base:
 			currentBase = sha
 		}
 	}

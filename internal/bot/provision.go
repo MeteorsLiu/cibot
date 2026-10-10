@@ -3,6 +3,7 @@ package bot
 import (
 	"context"
 	"fmt"
+	"log"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -26,6 +27,14 @@ func (b *Bot) provision(ctx context.Context, client *github.Client, indexRepo *g
 		if err != nil {
 			return err
 		}
+	}
+	tags, err := git(ctx, client, dir, "ls-remote", "--tags", "--refs", repository.GetCloneURL())
+	if err != nil {
+		return err
+	}
+	if tags != "" {
+		log.Printf("bot: skip project repo=%s/%s: repository has tags", owner, project.name)
+		return nil
 	}
 
 	sourceDir := filepath.Join(dir, "source")
@@ -127,19 +136,21 @@ func (b *Bot) provision(ctx context.Context, client *github.Client, indexRepo *g
 		return err
 	}
 	refs := []string{"refs/heads/c:refs/heads/c", "refs/heads/" + base + ":refs/heads/" + base}
-	tags, err := git(ctx, client, repoDir, "tag", "--list", "v0.1.0", "c/v0.1.0")
+	tags, err = git(ctx, client, repoDir, "ls-remote", "--tags", "--refs", "origin")
 	if err != nil {
 		return err
 	}
-	if tags == "" {
-		if _, err := git(ctx, client, repoDir, "tag", "c/v0.1.0", "c"); err != nil {
-			return err
-		}
-		if _, err := git(ctx, client, repoDir, "tag", "v0.1.0", base); err != nil {
-			return err
-		}
-		refs = append(refs, "refs/tags/c/v0.1.0", "refs/tags/v0.1.0")
+	if tags != "" {
+		log.Printf("bot: skip project repo=%s/%s: repository has tags before publication", owner, project.name)
+		return nil
 	}
+	if _, err := git(ctx, client, repoDir, "tag", "c/v0.1.0", "c"); err != nil {
+		return err
+	}
+	if _, err := git(ctx, client, repoDir, "tag", "v0.1.0", base); err != nil {
+		return err
+	}
+	refs = append(refs, "refs/tags/c/v0.1.0", "refs/tags/v0.1.0")
 	_, err = git(ctx, client, repoDir, append([]string{"push", "origin"}, refs...)...)
 	return err
 }

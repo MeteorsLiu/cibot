@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"sync/atomic"
@@ -99,17 +100,26 @@ func testPush(t *testing.T) {
 	}
 
 	for _, tc := range []struct {
-		name, owner, index, base  string
-		installation              int64
-		failGen, repeat, failPush bool
-		changeBranch, changeAt    string
-		wantError                 string
-		wantState                 asynq.TaskState
+		name, owner, index, base        string
+		installation                    int64
+		failGen, repeat, failPush       bool
+		changeBranch, changeAt          string
+		tag, tagQueryFailure            string
+		annotated, detachedTag, lateTag bool
+		wantError                       string
+		wantState                       asynq.TaskState
 	}{
 		{name: "production c push", owner: "llarhub", index: ".index", base: "main", installation: 7},
 		{name: "test c push", owner: "MeteorsLiu", index: "llarhub", base: "main", installation: 8},
 		{name: "registered project with a different default branch", owner: "MeteorsLiu", index: "llarhub", base: "trunk", installation: 9},
 		{name: "repeat delivery", owner: "MeteorsLiu", index: "llarhub", base: "main", installation: 8, repeat: true},
+		{name: "existing initial tag", owner: "MeteorsLiu", index: "llarhub", base: "main", installation: 8, tag: "v0.1.0", repeat: true},
+		{name: "existing c module tag", owner: "llarhub", index: ".index", base: "main", installation: 7, tag: "c/v0.1.0"},
+		{name: "arbitrary annotated tag", owner: "llarhub", index: ".index", base: "trunk", installation: 7, tag: "human/release", annotated: true},
+		{name: "tag outside branch history", owner: "MeteorsLiu", index: "llarhub", base: "main", installation: 8, tag: "archive", detachedTag: true},
+		{name: "tag added during generation", owner: "MeteorsLiu", index: "llarhub", base: "main", installation: 8, tag: "human-release", lateTag: true},
+		{name: "tag lookup failure", owner: "MeteorsLiu", index: "llarhub", base: "main", installation: 8, tagQueryFailure: "before", wantError: "git ls-remote: exit status 23", wantState: asynq.TaskStateRetry},
+		{name: "tag recheck failure", owner: "MeteorsLiu", index: "llarhub", base: "main", installation: 8, tagQueryFailure: "after", wantError: "git ls-remote: exit status 23", wantState: asynq.TaskStateRetry},
 		{name: "failed generation", owner: "MeteorsLiu", index: "llarhub", base: "main", installation: 8, failGen: true, wantError: "llcppg: exit status 7", wantState: asynq.TaskStateRetry},
 		{name: "both queued source revisions are stale", owner: "MeteorsLiu", index: "llarhub", base: "main", installation: 8, changeBranch: "c", changeAt: "queued", wantError: "c HEAD changed from", wantState: asynq.TaskStateArchived},
 		{name: "source advances during generation", owner: "llarhub", index: ".index", base: "main", installation: 7, changeBranch: "c", changeAt: "generation", wantError: "HEAD changed during generation", wantState: asynq.TaskStateArchived},
@@ -121,6 +131,7 @@ func testPush(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			bin := t.TempDir()
 			invoked := filepath.Join(t.TempDir(), "generated")
+			failTags := filepath.Join(t.TempDir(), "fail-tags")
 			generator := "#!/bin/sh\nset -eu\n[ -f \"$2/go.mod\" ]\n[ ! -f \"$2/versions.json\" ]\ngrep -Fq '#define LIBFOO_VALUE 1' \"$2/include/foo.h\"\ngrep -Fq '\"Name\":\"foo\"' \"$2/llcppg.cfg\"\ngrep -Fq 'link: $(pkg-config --libs foo)' \"$2/llcppg.cfg\"\nmkdir -p \"$1/sub\"\nprintf 'package foo\\n\\nconst LLGoPackage = \"link: $(pkg-config --libs foo)\"\\nconst Value = 1\\n' > \"$1/foo.go\"\nprintf 'package sub\\n\\nconst Value = 2\\n' > \"$1/sub/sub.go\"\n"
 			if tc.failGen {
 				generator = "#!/bin/sh\nexit 7\n"
@@ -144,9 +155,24 @@ func testPush(t *testing.T) {
 			testGitCommand(t, checkout, "add", "--all")
 			testGitCommand(t, checkout, "commit", "-m", "C source for this delivery")
 			after := testGitCommand(t, checkout, "rev-parse", "HEAD")
-			testGitCommand(t, checkout, "tag", "v0.1.0", baseSHA)
-			testGitCommand(t, checkout, "tag", "c/v0.1.0", after)
-			testGitCommand(t, checkout, "push", "origin", "c", "refs/tags/v0.1.0", "refs/tags/c/v0.1.0")
+			testGitCommand(t, checkout, "push", "origin", "c")
+			if tc.tag != "" {
+				if tc.detachedTag {
+					testGitCommand(t, checkout, "checkout", "--orphan", "archived-history")
+					testGitCommand(t, checkout, "commit", "-m", "Archived history")
+				}
+				if tc.annotated {
+					testGitCommand(t, checkout, "tag", "-a", tc.tag, "-m", "Human release")
+				} else {
+					testGitCommand(t, checkout, "tag", tc.tag)
+				}
+				if tc.lateTag {
+					generator += fmt.Sprintf("git -C %q push origin %q\n", checkout, "refs/tags/"+tc.tag)
+				} else {
+					testGitCommand(t, checkout, "push", "origin", "refs/tags/"+tc.tag)
+				}
+			}
+			wantTags := testGitCommand(t, checkout, "for-each-ref", "--format=%(refname) %(objectname)", "refs/tags/")
 			cHead, baseHead := after, baseSHA
 			revisions := []string{after}
 			if tc.repeat {
@@ -191,6 +217,23 @@ func testPush(t *testing.T) {
 					t.Fatal(err)
 				}
 				generator += fmt.Sprintf("cp %q \"$(dirname \"$2\")/repo/.git/hooks/pre-push\"\n", hookPath)
+			}
+			if tc.tagQueryFailure != "" {
+				realGit, err := exec.LookPath("git")
+				if err != nil {
+					t.Fatal(err)
+				}
+				wrapper := fmt.Sprintf("#!/bin/sh\ncase \" $* \" in *\" ls-remote \"*) [ ! -f %q ] || exit 23 ;; esac\nexec %q \"$@\"\n", failTags, realGit)
+				if err := os.WriteFile(filepath.Join(bin, "git"), []byte(wrapper), 0755); err != nil {
+					t.Fatal(err)
+				}
+				if tc.tagQueryFailure == "before" {
+					if err := os.WriteFile(failTags, nil, 0644); err != nil {
+						t.Fatal(err)
+					}
+				} else {
+					generator += fmt.Sprintf("touch %q\n", failTags)
+				}
 			}
 			if err := os.WriteFile(filepath.Join(bin, "llcppg"), []byte(generator), 0755); err != nil {
 				t.Fatal(err)
@@ -265,9 +308,9 @@ func testPush(t *testing.T) {
 				t.Fatalf("registration requests = %d, want %d", registrationCalls.Load(), len(revisions))
 			}
 			_, err := os.Stat(invoked)
-			if tc.changeAt == "queued" || tc.failGen {
+			if tc.changeAt == "queued" || tc.failGen || tc.tag != "" && !tc.lateTag || tc.tagQueryFailure == "before" {
 				if !os.IsNotExist(err) {
-					t.Fatalf("stale task or failed generator produced output: %v", err)
+					t.Fatalf("skipped task or failed generator produced output: %v", err)
 				}
 			} else if err != nil {
 				t.Fatalf("generator did not produce output: %v", err)
@@ -275,13 +318,10 @@ func testPush(t *testing.T) {
 			if got := testGitCommand(t, remote, "rev-parse", "c"); got != cHead {
 				t.Fatal("binding generation changed the source branch")
 			}
-			if testGitCommand(t, remote, "rev-parse", "v0.1.0") != baseSHA || testGitCommand(t, remote, "rev-parse", "c/v0.1.0") != after {
-				t.Fatal("c push moved an existing version tag")
+			if got := testGitCommand(t, remote, "for-each-ref", "--format=%(refname) %(objectname)", "refs/tags/"); got != wantTags {
+				t.Fatalf("c push changed tags: got %q, want %q", got, wantTags)
 			}
-			if tags := testGitCommand(t, remote, "tag", "--list"); tags != "c/v0.1.0\nv0.1.0" {
-				t.Fatalf("c push created unexpected tags: %s", tags)
-			}
-			if tc.wantError != "" {
+			if tc.wantError != "" || tc.tag != "" {
 				if got := testGitCommand(t, remote, "rev-parse", tc.base); got != baseHead {
 					t.Fatalf("stopped task changed the default branch: got %s, want %s", got, baseHead)
 				}

@@ -9,6 +9,7 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -16,6 +17,7 @@ import (
 	"time"
 
 	"github.com/google/go-github/v83/github"
+	"github.com/hibiken/asynq"
 )
 
 func testProvision(t *testing.T) {
@@ -26,6 +28,8 @@ func testProvision(t *testing.T) {
 		llvmConfig                          bool
 		moduleFiles                         bool
 		mainTag, cTag                       bool
+		tag, tagQueryFailure                string
+		annotated, detachedTag, lateTag     bool
 		toc                                 string
 	}{
 		{name: "new personal repository", owner: "MeteorsLiu", index: "llarhub", ownerType: "User", base: "main"},
@@ -35,6 +39,13 @@ func testProvision(t *testing.T) {
 		{name: "copy supplied module files into existing c branch", owner: "MeteorsLiu", index: "llarhub", ownerType: "User", base: "main", existing: true, cBranch: true, moduleFiles: true},
 		{name: "existing repository", owner: "MeteorsLiu", index: "llarhub", ownerType: "User", base: "main", existing: true, cBranch: true, mainTag: true, cTag: true},
 		{name: "existing repository without c branch", owner: "MeteorsLiu", index: "llarhub", ownerType: "User", base: "trunk", existing: true, mainTag: true, cTag: true},
+		{name: "untagged organization repository", owner: "llarhub", index: ".index", ownerType: "Organization", base: "main", existing: true, cBranch: true},
+		{name: "untagged repository with custom default branch", owner: "MeteorsLiu", index: "llarhub", ownerType: "User", base: "trunk", existing: true},
+		{name: "arbitrary annotated tag", owner: "llarhub", index: ".index", ownerType: "Organization", base: "main", existing: true, cBranch: true, tag: "human/release", annotated: true},
+		{name: "tag outside branch history", owner: "MeteorsLiu", index: "llarhub", ownerType: "User", base: "main", existing: true, tag: "archive", detachedTag: true},
+		{name: "tag added during generation", owner: "MeteorsLiu", index: "llarhub", ownerType: "User", base: "main", existing: true, cBranch: true, tag: "human-release", lateTag: true},
+		{name: "tag lookup failure", owner: "MeteorsLiu", index: "llarhub", ownerType: "User", base: "main", existing: true, cBranch: true, tagQueryFailure: "before"},
+		{name: "tag recheck failure", owner: "MeteorsLiu", index: "llarhub", ownerType: "User", base: "main", existing: true, cBranch: true, tagQueryFailure: "after"},
 		{name: "resume after repository creation", owner: "MeteorsLiu", index: "llarhub", ownerType: "User", base: "main", existing: true},
 		{name: "resume unpublished c branch", owner: "MeteorsLiu", index: "llarhub", ownerType: "User", base: "main", existing: true, cBranch: true},
 		{name: "preserve main tag alone", owner: "MeteorsLiu", index: "llarhub", ownerType: "User", base: "main", existing: true, cBranch: true, mainTag: true},
@@ -48,6 +59,8 @@ func testProvision(t *testing.T) {
 			workRoot := t.TempDir()
 			t.Setenv("TMPDIR", workRoot)
 			bin := t.TempDir()
+			invoked := filepath.Join(t.TempDir(), "invoked")
+			failTags := filepath.Join(t.TempDir(), "fail-tags")
 			llgoPackage := "link: $(pkg-config --libs foo)"
 			cflags := "$(pkg-config --cflags foo)"
 			if tc.llvmConfig {
@@ -55,7 +68,8 @@ func testProvision(t *testing.T) {
 				cflags = "$(llvm-config --cflags)"
 			}
 			llar := "#!/bin/sh\nset -eu\n[ \"$1\" = install ]\n[ \"$2\" = upstream/libfoo ]\n[ \"$3\" = -o ]\n[ -z \"$(printenv CIBOT_GIT_AUTH)\" ]\nmkdir -p \"$4/include\"\nprintf '#define LIBFOO_VALUE 1\\n' > \"$4/include/foo.h\"\n"
-			llcppg := "#!/bin/sh\nset -eu\n[ -z \"$(printenv CIBOT_GIT_AUTH)\" ]\n"
+			llar += fmt.Sprintf("printf llar >> %q\n", invoked)
+			llcppg := "#!/bin/sh\nset -eu\n[ -z \"$(printenv CIBOT_GIT_AUTH)\" ]\n" + fmt.Sprintf("printf llcppg >> %q\n", invoked)
 			if tc.existing {
 				llcppg += "[ \"$1\" != -init ]\n"
 			}
@@ -153,6 +167,46 @@ fi
 			if tc.cTag {
 				testGitCommand(t, projectCheckout, "tag", "c/v0.1.0", cParent)
 				testGitCommand(t, projectCheckout, "push", "origin", "refs/tags/c/v0.1.0")
+			}
+			if tc.tag != "" {
+				if tc.detachedTag {
+					testGitCommand(t, projectCheckout, "checkout", "--orphan", "archived-history")
+					testGitCommand(t, projectCheckout, "commit", "-m", "Archived history")
+				}
+				if tc.annotated {
+					testGitCommand(t, projectCheckout, "tag", "-a", tc.tag, "-m", "Human release")
+				} else {
+					testGitCommand(t, projectCheckout, "tag", tc.tag)
+				}
+				if tc.lateTag {
+					llcppg += fmt.Sprintf("git -C %q push origin %q\n", projectCheckout, "refs/tags/"+tc.tag)
+				} else {
+					testGitCommand(t, projectCheckout, "push", "origin", "refs/tags/"+tc.tag)
+				}
+			}
+			wantRefs := testGitCommand(t, projectRemote, "for-each-ref", "--format=%(refname) %(objectname)")
+			if tc.lateTag {
+				wantRefs += "\nrefs/tags/" + tc.tag + " " + testGitCommand(t, projectCheckout, "rev-parse", "refs/tags/"+tc.tag)
+			}
+			if tc.tagQueryFailure != "" {
+				realGit, err := exec.LookPath("git")
+				if err != nil {
+					t.Fatal(err)
+				}
+				wrapper := fmt.Sprintf("#!/bin/sh\ncase \" $* \" in *\" ls-remote \"*) [ ! -f %q ] || exit 23 ;; esac\nexec %q \"$@\"\n", failTags, realGit)
+				if err := os.WriteFile(filepath.Join(bin, "git"), []byte(wrapper), 0755); err != nil {
+					t.Fatal(err)
+				}
+				if tc.tagQueryFailure == "before" {
+					if err := os.WriteFile(failTags, nil, 0644); err != nil {
+						t.Fatal(err)
+					}
+				} else {
+					llcppg += fmt.Sprintf("touch %q\n", failTags)
+				}
+			}
+			if err := os.WriteFile(filepath.Join(bin, "llcppg"), []byte(llcppg), 0755); err != nil {
+				t.Fatal(err)
 			}
 			var mu sync.Mutex
 			created, pulls := 0, 0
@@ -264,8 +318,17 @@ fi
 					t.Fatalf("status = %d, want %d: %s", response.Code, want, response.Body.String())
 				}
 				err := waitTask(t, inspector, "pull_request:"+tc.owner+"/"+tc.index+"@"+mergeSHA)
-				if (err != nil) != (tc.failGen || tc.failInit) {
-					t.Fatalf("task error = %v, want failure=%t", err, tc.failGen || tc.failInit)
+				if (err != nil) != (tc.failGen || tc.failInit || tc.tagQueryFailure != "") {
+					t.Fatalf("task error = %v, want failure=%t", err, tc.failGen || tc.failInit || tc.tagQueryFailure != "")
+				}
+				if tc.tagQueryFailure != "" {
+					if !strings.Contains(err.Error(), "git ls-remote: exit status 23") {
+						t.Fatalf("task error = %v, want tag lookup failure", err)
+					}
+					info, err := inspector.GetTaskInfo(queueName, "pull_request:"+tc.owner+"/"+tc.index+"@"+mergeSHA)
+					if err != nil || info.State != asynq.TaskStateRetry {
+						t.Fatalf("tag lookup failure must retry: info=%+v, err=%v", info, err)
+					}
 				}
 			}
 			if !bot.initMu.TryLock() {
@@ -302,6 +365,20 @@ fi
 			}
 			if testGitCommand(t, indexRemote, "rev-parse", "main") != indexHead {
 				t.Fatal("bot changed the registry's main branch")
+			}
+			if tc.mainTag || tc.cTag || tc.tag != "" || tc.tagQueryFailure != "" {
+				if got := testGitCommand(t, projectRemote, "for-each-ref", "--format=%(refname) %(objectname)"); got != wantRefs {
+					t.Fatalf("skipped project changed refs:\n%s\nwant:\n%s", got, wantRefs)
+				}
+				_, err := os.Stat(invoked)
+				if tc.lateTag || tc.tagQueryFailure == "after" {
+					if err != nil {
+						t.Fatalf("generation did not reach the publication recheck: %v", err)
+					}
+				} else if !os.IsNotExist(err) {
+					t.Fatalf("tagged project or failed lookup ran llar/llcppg: %v", err)
+				}
+				return
 			}
 			if tc.failGen || tc.failInit {
 				if testGitCommand(t, projectRemote, "rev-parse", tc.base) != mainParent || testGitCommand(t, projectRemote, "tag", "--list") != "" {
