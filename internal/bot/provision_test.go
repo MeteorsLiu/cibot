@@ -94,6 +94,9 @@ func testProvision(t *testing.T) {
   exit 0
 fi
 `
+			if !tc.existing {
+				llcppg += "git rev-parse --verify --quiet refs/heads/raw >/dev/null\n"
+			}
 			if tc.failGen {
 				llcppg += "exit 7\n"
 			}

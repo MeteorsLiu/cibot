@@ -65,6 +65,9 @@ func (b *Bot) provision(ctx context.Context, client *github.Client, indexRepo *g
 		if err != nil {
 			return fmt.Errorf("llcppg -init: %w\n%s", err, output)
 		}
+		if _, err := git(ctx, client, repoDir, "branch", "raw"); err != nil {
+			return err
+		}
 	}
 	cBranch, err := git(ctx, client, repoDir, "branch", "--remotes", "--list", "origin/c")
 	if err != nil {
